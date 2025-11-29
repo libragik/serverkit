@@ -1,11 +1,13 @@
 import uvicorn
 from fastapi import FastAPI, BackgroundTasks, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import FileResponse
 from pydantic import BaseModel
 import uuid
 import time
 import os
 import sys
+import shutil
 import subprocess
 from typing import Optional
 from worker import SkoolClassroomScraper, Config as ScraperConfig
@@ -65,6 +67,31 @@ async def get_status(job_id: str):
         raise HTTPException(status_code=404, detail="Job not found")
     return jobs[job_id]
 
+@app.get("/api/download_result/{job_id}")
+async def download_result(job_id: str):
+    if job_id not in jobs:
+        raise HTTPException(status_code=404, detail="Job not found")
+    
+    job = jobs[job_id]
+    if job["status"] != "completed" or not job["result"]:
+         raise HTTPException(status_code=400, detail="Job not completed or no result found")
+    
+    output_dir = job["result"]
+    zip_filename = f"skool_export_{job_id}"
+    
+    # Create zip archive of the output directory
+    # make_archive saves to current directory, we return that path
+    try:
+        zip_path = shutil.make_archive(zip_filename, 'zip', output_dir)
+        return FileResponse(zip_path, media_type='application/zip', filename=f"{zip_filename}.zip")
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to create zip: {str(e)}")
+
+# Root endpoint for health check
+@app.get("/")
+def read_root():
+    return {"status": "ok", "message": "Skool Scraper API is running"}
+
 def run_scraper_task(job_id, request: ScrapeRequest):
     job = jobs[job_id]
     job["status"] = "running"
@@ -85,14 +112,16 @@ def run_scraper_task(job_id, request: ScrapeRequest):
         config.SKOOL_PASSWORD = request.password
         config.DOWNLOAD_FILES = request.downloadFiles
         config.HEADLESS = request.headless
-        # Adjust other defaults if needed
+        # Use unique output dir for this job to avoid collisions
+        config.OUTPUT_DIR = f"skool_export_{job_id}"
         
         log_callback("Initializing Scraper Engine...", "info")
         
         # Initialize Scraper with Callback
         scraper = SkoolClassroomScraper(config, callback=log_callback)
-        scraper.run()
+        result_path = scraper.run()
         
+        job["result"] = result_path
         job["status"] = "completed"
         job["progress"] = 100
         log_callback("Job finished successfully!", "success")
