@@ -84,6 +84,13 @@ class SkoolClassroomScraper:
 
     def _smart_delay(self):
         time.sleep(self.config.REQUEST_DELAY)
+    
+    def _sanitize_filename(self, name):
+        name = re.sub(r'[^a-zA-Z0-9\-\.]+', '-', name)
+        name = re.sub(r'-+', '-', name)
+        name = name.strip('-')
+        if not name: return 'untitled'
+        return name.lower()
 
     def run(self):
         self.log("🚀 Starting extraction process...", "info")
@@ -165,7 +172,7 @@ class SkoolClassroomScraper:
 
     def _download_media(self, url, module_name):
         try:
-            filename = f"{self._sanitize(module_name)}_{os.path.basename(urlparse(url).path)}"
+            filename = f"{self._sanitize_filename(module_name)}_{os.path.basename(urlparse(url).path)}"
             local_path = self.output_dir / self.config.MEDIA_DIR / filename
             if not local_path.exists():
                 resp = requests.get(url, stream=True)
@@ -178,9 +185,56 @@ class SkoolClassroomScraper:
         self.log("📥 Downloading attachments...", "info")
         files_dir = self.output_dir / "downloads"
         files_dir.mkdir(exist_ok=True)
-        # Simplified file download logic for brevity
-        # In real usage, iterate self.course_data similar to scraping modules
-        pass 
+        
+        structure = self._build_course_structure(self.course_data)
+        
+        # Iterate over sections/modules to find files
+        total_files = 0
+        for section in structure.get('modules', []):
+            section_name = self._sanitize_filename(section.get('name', 'section'))
+            for module in section.get('modules', []):
+                module_name = self._sanitize_filename(module.get('name', 'module'))
+                
+                module_files_dir = files_dir / section_name / module_name
+                module_files_dir.mkdir(parents=True, exist_ok=True)
+                
+                for file_info in module.get('files', []):
+                    if not file_info.get("file_id"): continue
+                    
+                    file_id = file_info.get("file_id")
+                    file_name = self._sanitize_filename(file_info.get("name") or file_info.get("title") or f"file_{file_id}")
+                    
+                    # Try to get extension from name, default to bin if unknown
+                    if '.' not in file_name: file_name += ".bin"
+                    
+                    output_path = module_files_dir / file_name
+                    
+                    try:
+                        # Attempt download via API URL pattern
+                        api_url = f"https://api2.skool.com/files/{file_id}/download-url?expire={self.config.FILE_EXPIRE_TIME}"
+                        resp = self.page.request.get(api_url, timeout=30000)
+                        
+                        download_url = None
+                        if resp.status == 200:
+                            try:
+                                jt = resp.json()
+                                download_url = jt.get('url') or jt.get('download_url')
+                            except:
+                                download_url = resp.text()
+                        
+                        if download_url:
+                            file_resp = self.page.request.get(download_url, timeout=60000)
+                            if file_resp.status == 200:
+                                with open(output_path, "wb") as f:
+                                    f.write(file_resp.body())
+                                total_files += 1
+                                self.log(f"Downloaded: {file_name}", "info")
+                    except Exception as e:
+                        self.log(f"Failed to download {file_name}: {e}", "error")
+                    
+                    time.sleep(1) # Polite delay
+
+        self.stats['files_downloaded'] = total_files
 
     def _generate_html_website(self):
         self.log("🌐 Generating static website...", "info")
@@ -190,21 +244,100 @@ class SkoolClassroomScraper:
         with open(assets_dir / "script.js", 'w') as f: f.write(JS_CONTENT)
         
         structure = self._build_course_structure(self.course_data)
+        
         # Generate Index
         with open(self.output_dir / "index.html", 'w', encoding='utf-8') as f:
             f.write(HTML_TEMPLATE.format(
                 title="Course Index", course_name=structure['name'], 
                 css_path="assets/", js_path="assets/", 
-                navigation="", content="<h1>Course Index</h1><p>Open sidebar to navigate.</p>"
+                navigation=self._generate_navigation(structure, "index.html"), 
+                content="<h1>Course Index</h1><p>Welcome to the course archive.</p>"
             ))
+            
+        # Generate Module Pages
+        for section in structure['modules']:
+            for module in section['modules']:
+                module_filename = f"{self._sanitize_filename(section['name'])}/{self._sanitize_filename(module['name'])}.html"
+                full_path = self.output_dir / module_filename
+                full_path.parent.mkdir(parents=True, exist_ok=True)
+                
+                content_html = f"<h1>{escape(module['name'])}</h1>"
+                if module['id'] in self.module_contents:
+                    content_html += f"<div class='module-content'>{self.module_contents[module['id']]}</div>"
+                
+                # Add file links
+                files = [f for f in module.get('files', []) if f.get('file_id')]
+                if files:
+                    content_html += "<h3>Attachments</h3><ul>"
+                    for f in files:
+                        fname = self._sanitize_filename(f.get('name') or 'file')
+                        fpath = f"../downloads/{self._sanitize_filename(section['name'])}/{self._sanitize_filename(module['name'])}/{fname}"
+                        content_html += f"<li><a href='{fpath}'>{escape(fname)}</a></li>"
+                    content_html += "</ul>"
+
+                with open(full_path, 'w', encoding='utf-8') as f:
+                    f.write(HTML_TEMPLATE.format(
+                        title=module['name'], course_name=structure['name'],
+                        css_path="../assets/", js_path="../assets/",
+                        navigation=self._generate_navigation(structure, module_filename),
+                        content=content_html
+                    ))
+
+    def _generate_navigation(self, structure, current_page):
+        # Basic nav generation
+        is_nested = '/' in current_page and current_page != 'index.html'
+        root_link = '../index.html' if is_nested else 'index.html'
+        
+        html = f'<a href="{root_link}" class="nav-item">Index</a>'
+        for section in structure['modules']:
+            for module in section['modules']:
+                m_fname = f"{self._sanitize_filename(section['name'])}/{self._sanitize_filename(module['name'])}.html"
+                link = f"../{m_fname}" if is_nested else m_fname
+                active = ' active' if current_page == m_fname else ''
+                html += f'<a href="{link}" class="nav-item{active}">{escape(module["name"])}</a>'
+        return html
 
     def _build_course_structure(self, course_data):
-        # ... (Existing logic to parse Skool JSON) ...
-        # Simplified for template:
-        return {'name': 'Course', 'modules': []}
-
-    def _sanitize(self, name):
-        return re.sub(r'[^a-zA-Z0-9]+', '-', name).strip('-').lower()
+        # Robust parsing logic from original script
+        actual_course = course_data.get('course', {})
+        modules = []
+        
+        # Check for children (sets/modules)
+        children = course_data.get('children', [])
+        if not children and course_data.get('sets'):
+            return {'name': actual_course.get('name', 'Course'), 'modules': course_data.get('sets', [])}
+            
+        for child in children:
+            c_type = child.get('course', {}).get('unitType')
+            if c_type == 'set':
+                set_data = child['course']
+                set_modules = []
+                for m_child in child.get('children', []):
+                    m_data = m_child['course']
+                    set_modules.append({
+                        'id': m_data['id'],
+                        'name': m_data.get('metadata', {}).get('title', m_data['name']),
+                        'files': json.loads(m_data.get('metadata', {}).get('resources', '[]'))
+                    })
+                modules.append({
+                    'name': set_data.get('metadata', {}).get('title', set_data['name']),
+                    'modules': set_modules
+                })
+            elif c_type == 'module':
+                m_data = child['course']
+                modules.append({
+                    'name': 'General',
+                    'modules': [{
+                        'id': m_data['id'],
+                        'name': m_data.get('metadata', {}).get('title', m_data['name']),
+                        'files': json.loads(m_data.get('metadata', {}).get('resources', '[]'))
+                    }]
+                })
+        
+        return {
+            'name': actual_course.get('metadata', {}).get('title', actual_course.get('name', 'Course')),
+            'modules': modules
+        }
 
     def _print_summary(self):
-        self.log(f"Job finished! Processed {self.stats['total_modules']} modules.", "success")
+        self.log(f"Job finished! Processed {self.stats['total_modules']} modules, Downloaded {self.stats['files_downloaded']} files.", "success")
