@@ -70,7 +70,7 @@ async def get_status(job_id: str):
 @app.get("/api/download_result/{job_id}")
 async def download_result(job_id: str):
     if job_id not in jobs:
-        raise HTTPException(status_code=404, detail="Job not found")
+        raise HTTPException(status_code=404, detail="Job not found (Server may have restarted)")
     
     job = jobs[job_id]
     if job["status"] != "completed" or not job["result"]:
@@ -79,12 +79,16 @@ async def download_result(job_id: str):
     output_dir = job["result"]
     zip_filename = f"skool_export_{job_id}"
     
+    if not os.path.exists(output_dir):
+        raise HTTPException(status_code=404, detail="Output directory missing (Files may have expired)")
+
     # Create zip archive of the output directory
-    # make_archive saves to current directory, we return that path
     try:
+        # shutil.make_archive saves to current directory if root_dir is specified
         zip_path = shutil.make_archive(zip_filename, 'zip', output_dir)
         return FileResponse(zip_path, media_type='application/zip', filename=f"{zip_filename}.zip")
     except Exception as e:
+        print(f"Zip Error: {e}")
         raise HTTPException(status_code=500, detail=f"Failed to create zip: {str(e)}")
 
 # Root endpoint for health check
@@ -113,7 +117,7 @@ def run_scraper_task(job_id, request: ScrapeRequest):
         config.DOWNLOAD_FILES = request.downloadFiles
         config.HEADLESS = request.headless
         # Use unique output dir for this job to avoid collisions
-        config.OUTPUT_DIR = f"skool_export_{job_id}"
+        config.OUTPUT_DIR = os.path.abspath(f"skool_export_{job_id}")
         
         log_callback("Initializing Scraper Engine...", "info")
         
